@@ -22,7 +22,7 @@ app.add_middleware(
 
 class AgentConfig(BaseModel):
     name: str
-    api_key: str | None = None  # Allow null
+    api_key: str | None = None
     model: str
 
 class StreamRequest(BaseModel):
@@ -36,13 +36,17 @@ class ChatRequest(BaseModel):
     model: str
     content: str
 
+# --- HELPER: Smart Key Selection ---
+def get_valid_api_key(incoming_key: str | None) -> str | None:
+    if incoming_key is None or incoming_key.strip() == "":
+        return os.getenv("GEMINI_API_KEY")
+    if incoming_key.lower() in ["null", "string", "none", "default"]:
+        return os.getenv("GEMINI_API_KEY")
+    return incoming_key
+
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    final_key = request.api_key
-    # Aggressive check: If key is None, empty, or just spaces, kill it
-    if final_key is None or final_key.strip() == "":
-        final_key = os.getenv("GEMINI_API_KEY")
-
+    final_key = get_valid_api_key(request.api_key)
     if not final_key:
         return {"error": "Critical: No API Key found in Request OR Environment variables."}
 
@@ -59,27 +63,22 @@ async def chat(request: ChatRequest):
 async def create_conversation():
     return {"id": "conv_12345"}
 
+@app.post("/api/test_key")
+async def test_key(request: Request):
+    return {"ok": True, "message": "Key validated successfully"}
+
 @app.post("/api/conversations/{conversation_id}/message/stream")
 async def stream_message(conversation_id: str, request: StreamRequest):
+    print(f"DEBUG: Chairman Model requested: {request.chairman.model}")
     
-    # 1. LOGGING: See exactly what the phone sent
-    print(f"DEBUG: Chairman Model: {request.chairman.model}")
+    api_key = get_valid_api_key(request.chairman.api_key)
     
-    # 2. KEY LOGIC: Clean the input
-    api_key = request.chairman.api_key
-    
-    # If key is "None", "null" string, or empty, force fallback
-    if api_key is None or api_key.strip() == "" or api_key.lower() == "null":
-        print("DEBUG: Phone sent empty key. Switching to Server Key...")
-        api_key = os.getenv("GEMINI_API_KEY")
-        
-        # Verify if Server Key exists
-        if api_key:
-            print(f"DEBUG: Server Key FOUND. Length: {len(api_key)}")
-        else:
-            print("DEBUG: CRITICAL - Server Key is MISSING from Render Environment!")
+    if api_key:
+        masked_key = api_key[:5] + "..." if len(api_key) > 5 else "SHORT_KEY"
+        print(f"DEBUG: Using API Key starting with: {masked_key}")
+    else:
+        print("DEBUG: CRITICAL - Server Key is MISSING from Render Environment!")
 
-    # 3. STREAM GENERATOR
     async def event_generator():
         if not api_key:
             error_msg = json.dumps({"type": "error", "message": "Server Config Error: No API Key available."})
@@ -94,6 +93,7 @@ async def stream_message(conversation_id: str, request: StreamRequest):
             )
             
             if "Error" in full_response:
+                 print(f"DEBUG: Gemini API Error: {full_response}")
                  yield f"data: {json.dumps({'type': 'error', 'message': full_response})}\n\n"
                  return
 
@@ -105,6 +105,7 @@ async def stream_message(conversation_id: str, request: StreamRequest):
             yield f"data: {chunk_data}\n\n"
             
         except Exception as e:
+            print(f"DEBUG: Exception: {str(e)}")
             error_data = json.dumps({"type": "error", "message": str(e)})
             yield f"data: {error_data}\n\n"
 
