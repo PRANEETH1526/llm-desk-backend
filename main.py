@@ -39,22 +39,22 @@ class ChatRequest(BaseModel):
 # --- HELPER: Smart Key Selection ---
 # --- HELPER: Smart Key Selection ---
 def get_valid_api_key(incoming_key: str | None) -> str | None:
-    # 1. Check incoming key from phone
-    if incoming_key and incoming_key.strip() != "" and incoming_key.lower() not in ["null", "string", "none"]:
-        return incoming_key
+    # 1. Load Environment Keys
+    env_openrouter = os.getenv("OPENROUTER_API_KEY")
+    env_gemini = os.getenv("GEMINI_API_KEY")
 
-    # 2. Fallback: Try OpenRouter Key first (Most flexible)
-    openrouter = os.getenv("OPENROUTER_API_KEY")
-    if openrouter:
-        return openrouter
-        
-    # 3. Fallback: Try Gemini Key
-    gemini = os.getenv("GEMINI_API_KEY")
-    if gemini:
-        return gemini
+    # 2. Check Incoming Key from Phone
+    if incoming_key and incoming_key.strip() != "":
+        # Filter out dummy values
+        if incoming_key.lower() not in ["null", "string", "none", "default"]:
+            return incoming_key
 
-    # 4. Fallback: Try Groq Key
-    return os.getenv("GROQ_API_KEY")
+    # 3. Fallback Priority
+    # If phone sent nothing, try OpenRouter env key first, then Gemini
+    if env_openrouter: return env_openrouter
+    if env_gemini: return env_gemini
+    
+    return None
 @app.post("/chat")
 async def chat(request: ChatRequest):
     final_key = get_valid_api_key(request.api_key)
