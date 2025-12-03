@@ -20,11 +20,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- NEW DATA MODELS ---
-# We need to accept the complex "Council" data your frontend sends
 class AgentConfig(BaseModel):
     name: str
-    api_key: str
+    api_key: str | None = None  # Allow null
     model: str
 
 class StreamRequest(BaseModel):
@@ -33,53 +31,72 @@ class StreamRequest(BaseModel):
     chairman: AgentConfig
     task: str
 
-# --- ENDPOINT 1: Test Key ---
-# Frontend calls: POST /api/test_key
-@app.post("/api/test_key")
-async def test_key(request: Request):
-    # For now, we just return success to let the app proceed
-    return {"ok": True, "message": "Key validated successfully"}
+class ChatRequest(BaseModel):
+    api_key: str | None = None
+    model: str
+    content: str
 
-# --- ENDPOINT 2: Create Conversation ---
-# Frontend calls: POST /api/conversations
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    final_key = request.api_key
+    # Aggressive check: If key is None, empty, or just spaces, kill it
+    if final_key is None or final_key.strip() == "":
+        final_key = os.getenv("GEMINI_API_KEY")
+
+    if not final_key:
+        return {"error": "Critical: No API Key found in Request OR Environment variables."}
+
+    result = await generate_response(
+        api_key=final_key,
+        model=request.model,
+        content=request.content
+    )
+    if "Error" in result:
+         return {"error": result}
+    return {"response": result}
+
 @app.post("/api/conversations")
 async def create_conversation():
-    # Return a generated ID so the frontend knows where to send messages
     return {"id": "conv_12345"}
 
-# --- ENDPOINT 3: Stream Message (The Main Chat) ---
-# Frontend calls: POST /api/conversations/{id}/message/stream
 @app.post("/api/conversations/{conversation_id}/message/stream")
 async def stream_message(conversation_id: str, request: StreamRequest):
     
-    # 1. Get the prompt from the frontend
-    user_prompt = request.content
+    # 1. LOGGING: See exactly what the phone sent
+    print(f"DEBUG: Chairman Model: {request.chairman.model}")
     
-    # 2. Get API Key (use Chairman's key or fallback to .env)
+    # 2. KEY LOGIC: Clean the input
     api_key = request.chairman.api_key
-    if not api_key:
+    
+    # If key is "None", "null" string, or empty, force fallback
+    if api_key is None or api_key.strip() == "" or api_key.lower() == "null":
+        print("DEBUG: Phone sent empty key. Switching to Server Key...")
         api_key = os.getenv("GEMINI_API_KEY")
+        
+        # Verify if Server Key exists
+        if api_key:
+            print(f"DEBUG: Server Key FOUND. Length: {len(api_key)}")
+        else:
+            print("DEBUG: CRITICAL - Server Key is MISSING from Render Environment!")
 
-    # 3. Create a generator to "stream" the response
+    # 3. STREAM GENERATOR
     async def event_generator():
+        if not api_key:
+            error_msg = json.dumps({"type": "error", "message": "Server Config Error: No API Key available."})
+            yield f"data: {error_msg}\n\n"
+            return
+
         try:
-            # We use your existing Groq logic to get the answer
             full_response = await generate_response(
                 api_key=api_key,
                 model=request.chairman.model,
-                content=user_prompt
+                content=request.content
             )
             
-            # If the response itself is an error string, handle it
             if "Error" in full_response:
                  yield f"data: {json.dumps({'type': 'error', 'message': full_response})}\n\n"
                  return
 
-            # SEND DATA: The frontend expects chunks, but Groq sends all at once.
-            # We verify the format matches what api_service.dart expects:
-            # yield jsonDecode(jsonStr) as Map<String, dynamic>;
-            
-            # Send the full text as one "chunk" for now
             chunk_data = json.dumps({
                 "role": "assistant",
                 "content": full_response,
@@ -91,5 +108,4 @@ async def stream_message(conversation_id: str, request: StreamRequest):
             error_data = json.dumps({"type": "error", "message": str(e)})
             yield f"data: {error_data}\n\n"
 
-    # Return as a proper Event Stream
     return StreamingResponse(event_generator(), media_type="text/event-stream")
