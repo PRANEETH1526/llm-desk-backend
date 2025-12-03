@@ -20,6 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- MODELS ---
 class AgentConfig(BaseModel):
     name: str
     api_key: str | None = None
@@ -37,24 +38,28 @@ class ChatRequest(BaseModel):
     content: str
 
 # --- HELPER: Smart Key Selection ---
-# --- HELPER: Smart Key Selection ---
 def get_valid_api_key(incoming_key: str | None) -> str | None:
     # 1. Load Environment Keys
     env_openrouter = os.getenv("OPENROUTER_API_KEY")
     env_gemini = os.getenv("GEMINI_API_KEY")
+    env_groq = os.getenv("GROQ_API_KEY")
 
     # 2. Check Incoming Key from Phone
     if incoming_key and incoming_key.strip() != "":
-        # Filter out dummy values
+        # Filter out dummy values that might come from the frontend
         if incoming_key.lower() not in ["null", "string", "none", "default"]:
             return incoming_key
 
     # 3. Fallback Priority
-    # If phone sent nothing, try OpenRouter env key first, then Gemini
+    # If phone sent nothing (or dummy), try OpenRouter first (universal), then others
     if env_openrouter: return env_openrouter
     if env_gemini: return env_gemini
+    if env_groq: return env_groq
     
     return None
+
+# --- ENDPOINTS ---
+
 @app.post("/chat")
 async def chat(request: ChatRequest):
     final_key = get_valid_api_key(request.api_key)
@@ -78,46 +83,84 @@ async def create_conversation():
 async def test_key(request: Request):
     return {"ok": True, "message": "Key validated successfully"}
 
+# --- THE CRITICAL STREAMING ENDPOINT ---
 @app.post("/api/conversations/{conversation_id}/message/stream")
 async def stream_message(conversation_id: str, request: StreamRequest):
-    print(f"DEBUG: Chairman Model requested: {request.chairman.model}")
     
-    api_key = get_valid_api_key(request.chairman.api_key)
-    
-    if api_key:
-        masked_key = api_key[:5] + "..." if len(api_key) > 5 else "SHORT_KEY"
-        print(f"DEBUG: Using API Key starting with: {masked_key}")
-    else:
-        print("DEBUG: CRITICAL - Server Key is MISSING from Render Environment!")
+    print(f"DEBUG: Starting Council Session. Task: {request.task}")
 
     async def event_generator():
-        if not api_key:
-            error_msg = json.dumps({"type": "error", "message": "Server Config Error: No API Key available."})
-            yield f"data: {error_msg}\n\n"
-            return
+        council_context = []
+
+        # --- PHASE 1: THE COUNCIL MEMBERS LOOP ---
+        # This fixes the "vanishing text" by sending specific 'member_chunk' events
+        for member in request.council:
+            print(f"DEBUG: Consulting Member: {member.name} ({member.model})")
+            
+            # 1. Get Key for this member
+            member_key = get_valid_api_key(member.api_key)
+            if not member_key:
+                error_msg = f"Error: No API Key for {member.name}"
+                yield f"data: {json.dumps({'type': 'error', 'member': member.name, 'message': error_msg})}\n\n"
+                continue
+
+            try:
+                # 2. Call the AI
+                response_text = await generate_response(
+                    api_key=member_key,
+                    model=member.model,
+                    content=request.content # The user's prompt
+                )
+
+                # 3. Send "member_chunk" (This makes it appear in the glass bubble!)
+                chunk_data = json.dumps({
+                    "type": "member_chunk",
+                    "member": member.name,
+                    "chunk": response_text
+                })
+                yield f"data: {chunk_data}\n\n"
+                
+                # 4. Send "member_done"
+                yield f"data: {json.dumps({'type': 'member_done', 'member': member.name})}\n\n"
+                
+                # Save context for the Chairman
+                council_context.append(f"[{member.name}]: {response_text}")
+
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'error', 'member': member.name, 'message': str(e)})}\n\n"
+
+        # --- PHASE 2: THE CHAIRMAN ---
+        print("DEBUG: Chairman is synthesizing...")
+        
+        # Create a prompt that includes the members' opinions
+        chairman_prompt = (
+            f"User Question: {request.content}\n\n"
+            f"Council Opinions:\n" + "\n".join(council_context) + "\n\n"
+            f"Task: {request.task}\n"
+            f"Synthesize a final response based on the opinions above."
+        )
+
+        chairman_key = get_valid_api_key(request.chairman.api_key)
+        
+        if not chairman_key:
+             yield f"data: {json.dumps({'type': 'error', 'message': 'No Key for Chairman'})}\n\n"
+             return
 
         try:
-            full_response = await generate_response(
-                api_key=api_key,
+            final_response = await generate_response(
+                api_key=chairman_key,
                 model=request.chairman.model,
-                content=request.content
+                content=chairman_prompt
             )
-            
-            if "Error" in full_response:
-                 print(f"DEBUG: Gemini API Error: {full_response}")
-                 yield f"data: {json.dumps({'type': 'error', 'message': full_response})}\n\n"
-                 return
 
-            chunk_data = json.dumps({
-                "role": "assistant",
-                "content": full_response,
-                "type": "content"
-            })
-            yield f"data: {chunk_data}\n\n"
-            
+            if "Error" in final_response:
+                yield f"data: {json.dumps({'type': 'error', 'message': final_response})}\n\n"
+            else:
+                # Send "chairman_chunk" (This makes it appear in the Green box)
+                yield f"data: {json.dumps({'type': 'chairman_chunk', 'chunk': final_response})}\n\n"
+                yield f"data: {json.dumps({'type': 'chairman_done'})}\n\n"
+
         except Exception as e:
-            print(f"DEBUG: Exception: {str(e)}")
-            error_data = json.dumps({"type": "error", "message": str(e)})
-            yield f"data: {error_data}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
