@@ -1,52 +1,51 @@
 import httpx
-import os
-
-# CHANGED: Use Groq URL instead of OpenRouter
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+import json
 
 async def generate_response(api_key: str, model: str, content: str):
+    # Default to Gemini 1.5 Flash if no model is specified or if an incompatible model name is sent
+    # Valid Gemini models: "gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"
+    target_model = "gemini-1.5-flash"
+    
+    if "gemini" in model.lower():
+        target_model = model
+    
+    # Gemini uses the API Key in the URL, not the Headers
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
+
     headers = {
-        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
 
-    # CHANGED: Map generic model names to specific Groq model IDs
-    # Groq supports: llama3-8b-8192, llama3-70b-8192, mixtral-8x7b-32768, gemma-7b-it
-    target_model = model
-    if "llama" in model.lower():
-        target_model = "llama3-70b-8192" # Fallback to a valid Groq model
-    elif "mixtral" in model.lower():
-        target_model = "mixtral-8x7b-32768"
-    else:
-        # Default fallback if the frontend sends a model Groq doesn't know
-        target_model = "llama3-70b-8192"
-
+    # Gemini expects a different JSON structure than OpenAI/Groq
     payload = {
-        "model": target_model,
-        "messages": [
-            {"role": "user", "content": content}
-        ],
-        "max_tokens": 300
+        "contents": [{
+            "parts": [{"text": content}]
+        }]
     }
-
-    # Verify we are sending to the right place
-    print(f"DEBUG: Sending to {GROQ_URL} with model {target_model}")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            response = await client.post(GROQ_URL, json=payload, headers=headers)
+            response = await client.post(url, json=payload, headers=headers)
             
             if response.status_code != 200:
-                # Print exact error for debugging
-                print(f"API ERROR: {response.text}") 
                 return f"Error {response.status_code}: {response.text}"
 
             data = response.json()
             
-            if "choices" in data and len(data["choices"]) > 0:
-                return data["choices"][0]["message"]["content"]
-            else:
-                return f"API Error: {data}"
-                
+            # Parse Gemini's specific response structure
+            # structure: candidates[0] -> content -> parts[0] -> text
+            try:
+                if "candidates" in data and len(data["candidates"]) > 0:
+                    candidate = data["candidates"][0]
+                    if "content" in candidate and "parts" in candidate["content"]:
+                        return candidate["content"]["parts"][0]["text"]
+                    else:
+                        # Sometimes Gemini blocks content for safety
+                        return "Response blocked by safety filters."
+                else:
+                    return f"API Error (No candidates): {data}"
+            except KeyError:
+                return f"Parsing Error: {data}"
+
         except Exception as e:
             return f"Connection Error: {str(e)}"
